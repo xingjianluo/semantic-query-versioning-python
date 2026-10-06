@@ -59,6 +59,28 @@ class VersionConflictError(SemanticQueryError):
     code = "version_conflict"
 
 
+class VersionUnavailableError(SemanticQueryError):
+    """指定的版本曾经发布过，但已被保留策略清理，无法再查询。
+
+    与 VersionNotFoundError 区分：not_found 表示从未发布过；
+    unavailable 表示发布过但当前不可用（已清理），绝不静默回退到最新版本。
+    """
+
+    code = "version_unavailable"
+
+
+class VersionsIncomparableError(SemanticQueryError):
+    """两个版本无法对比（某个版本不存在/不可用，或表集合不一致）。"""
+
+    code = "versions_incomparable"
+
+
+class VersionInUseError(SemanticQueryError):
+    """保留清理时，候选版本仍被进行中的查询引用，拒绝清理。"""
+
+    code = "version_in_use"
+
+
 class NoActiveVersionError(SemanticQueryError):
     """尚无任何已发布版本，无法查询或回滚。"""
 

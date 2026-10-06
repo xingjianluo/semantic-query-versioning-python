@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from semantic_query.errors import NoActiveVersionError, VersionConflictError
-from semantic_query.models import Column, ColumnType, Table, TableSchema
+from semantic_query.models import Table, TableSchema
 from semantic_query.query import parse_query
 from semantic_query.service import QueryService
 
