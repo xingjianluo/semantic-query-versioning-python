@@ -1,9 +1,11 @@
-"""FastAPI 入口：暴露查询与版本发布/回滚接口。
+"""FastAPI 入口：暴露查询与版本发布/回滚/对比/清理接口。
 
-POST /query              执行受控查询，失败返回可区分的 error code
+POST /query              执行受控查询（可带 "version" 指定历史版本），失败返回可区分的 error code
 POST /versions/publish   发布版本 {"version_id": "...", "tables": {...}}
-POST /versions/rollback  回滚到上一个版本
-GET  /versions           查看版本历史与当前版本
+POST /versions/rollback  回滚到上一个版本；带 {"version_id": "..."} 则回滚到指定版本
+POST /versions/diff      对比两个版本 {"from": "v1", "to": "v2"}
+POST /versions/prune     按保留范围清理老版本 {"keep_last": 3}
+GET  /versions           查看版本历史、当前版本与已清理版本
 """
 
 from __future__ import annotations
@@ -55,8 +57,14 @@ def read_root() -> dict:
 
 @app.post("/query")
 def run_query(spec: dict) -> dict:
-    query = parse_query(spec)
-    return service.run(query)
+    if not isinstance(spec, dict):
+        raise QuerySyntaxError(f"查询必须是 JSON 对象, 得到: {spec!r}")
+    version_id = spec.get("version")
+    if version_id is not None and not isinstance(version_id, str):
+        raise QuerySyntaxError(f"version 必须是字符串, 得到: {version_id!r}")
+    body = {k: v for k, v in spec.items() if k != "version"}
+    query = parse_query(body)
+    return service.run(query, version_id=version_id)
 
 
 @app.post("/versions/publish")
@@ -68,13 +76,41 @@ def publish(spec: dict) -> dict:
 
 
 @app.post("/versions/rollback")
-def rollback() -> dict:
+def rollback(spec: dict | None = None) -> dict:
+    if isinstance(spec, dict) and spec.get("version_id") is not None:
+        version_id = spec["version_id"]
+        if not isinstance(version_id, str):
+            raise QuerySyntaxError(f"version_id 必须是字符串, 得到: {version_id!r}")
+        return {"current_version": service.rollback_to(version_id)}
     return {"current_version": service.rollback()}
+
+
+@app.post("/versions/diff")
+def diff(spec: dict) -> dict:
+    if not isinstance(spec, dict):
+        raise QuerySyntaxError(f"diff 请求必须是 JSON 对象, 得到: {spec!r}")
+    from_version, to_version = spec.get("from"), spec.get("to")
+    if not isinstance(from_version, str) or not isinstance(to_version, str):
+        raise QuerySyntaxError(
+            f"diff 需要字符串 from/to, 得到: from={from_version!r} to={to_version!r}"
+        )
+    return service.diff(from_version, to_version)
+
+
+@app.post("/versions/prune")
+def prune(spec: dict) -> dict:
+    if not isinstance(spec, dict):
+        raise QuerySyntaxError(f"prune 请求必须是 JSON 对象, 得到: {spec!r}")
+    return service.prune(spec.get("keep_last"))
 
 
 @app.get("/versions")
 def versions() -> dict:
-    return {"current_version": service.current_version_id(), "history": service.history()}
+    return {
+        "current_version": service.current_version_id(),
+        "history": service.history(),
+        "retired": service.retired(),
+    }
 
 
 if __name__ == "__main__":

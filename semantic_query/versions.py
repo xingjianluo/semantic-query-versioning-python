@@ -22,6 +22,7 @@ from .errors import (
     TypeMismatchError,
     VersionConflictError,
     VersionNotFoundError,
+    VersionRetiredError,
 )
 from .models import ColumnType, DatasetVersion, Table
 
@@ -87,6 +88,8 @@ class VersionStore:
         self._lock = threading.RLock()
         self._published: dict[str, DatasetVersion] = {}
         self._history: list[str] = []  # 栈顶为当前版本
+        self._retired: set[str] = set()  # 曾被发布但已被保留策略清理的版本
+        self._pins: dict[str, int] = {}  # version_id -> 进行中的查询引用数
 
     def publish(self, version_id: str, tables: dict[str, Table]) -> DatasetVersion:
         if not isinstance(version_id, str) or not version_id:
@@ -127,6 +130,11 @@ class VersionStore:
         with self._lock:
             version = self._published.get(version_id)
             if version is None:
+                if version_id in self._retired:
+                    raise VersionRetiredError(
+                        f"版本 {version_id!r} 已被保留策略清理，不再可用",
+                        detail={"version_id": version_id, "retired": True},
+                    )
                 raise VersionNotFoundError(
                     f"版本 {version_id!r} 不存在",
                     detail={"version_id": version_id, "known": sorted(self._published)},
@@ -146,3 +154,108 @@ class VersionStore:
     def history(self) -> list[str]:
         with self._lock:
             return list(self._history)
+
+    def retired(self) -> list[str]:
+        with self._lock:
+            return sorted(self._retired)
+
+    def acquire(self, version_id: str | None = None) -> DatasetVersion:
+        """取版本快照并加引用钉（pin）：清理策略不得清掉被钉住的版本。
+
+        version_id 为 None 时取当前生效版本。调用方必须配对调用 release()。
+        指定版本从未发布 -> VersionNotFoundError；已被清理 -> VersionRetiredError。
+        """
+        with self._lock:
+            if version_id is None:
+                if not self._history:
+                    raise NoActiveVersionError("尚未发布任何版本，无法执行查询")
+                version_id = self._history[-1]
+            version = self._published.get(version_id)
+            if version is None:
+                if version_id in self._retired:
+                    raise VersionRetiredError(
+                        f"版本 {version_id!r} 已被保留策略清理，不再可用",
+                        detail={"version_id": version_id, "retired": True},
+                    )
+                raise VersionNotFoundError(
+                    f"版本 {version_id!r} 不存在",
+                    detail={"version_id": version_id, "known": sorted(self._published)},
+                )
+            self._pins[version_id] = self._pins.get(version_id, 0) + 1
+            return version
+
+    def release(self, version_id: str) -> None:
+        """解除 acquire 加的引用钉。"""
+        with self._lock:
+            count = self._pins.get(version_id, 0)
+            if count <= 1:
+                self._pins.pop(version_id, None)
+            else:
+                self._pins[version_id] = count - 1
+
+    def prune(self, keep_last: int) -> dict:
+        """按保留范围清理老版本：只保留最近 keep_last 个历史版本。
+
+        安全保证：
+        - 当前生效版本（历史栈顶）永远在保留范围内，绝不清除；
+        - 正被查询钉住（pin）的版本跳过清除，并在报告中列出；
+        - 整个清理在同一把锁内一次性完成：先算好新状态再整体替换，
+          中途失败/异常不会留下"列表与可查版本不一致"的半成品状态。
+        """
+        if isinstance(keep_last, bool) or not isinstance(keep_last, int) or keep_last < 1:
+            raise QuerySyntaxError(
+                f"keep_last 必须是 >= 1 的整数, 得到: {keep_last!r}",
+                detail={"keep_last": keep_last},
+            )
+        with self._lock:
+            keep_ids = set(self._history[-keep_last:])  # 含当前版本
+            pruned: list[str] = []
+            kept_pinned: list[str] = []
+            new_published: dict[str, DatasetVersion] = {}
+            for vid, version in self._published.items():
+                if vid in keep_ids:
+                    new_published[vid] = version
+                elif self._pins.get(vid, 0) > 0:
+                    new_published[vid] = version  # 被查询引用，跳过
+                    kept_pinned.append(vid)
+                else:
+                    pruned.append(vid)
+            new_history = [vid for vid in self._history if vid in new_published]
+            # 原子替换：版本列表（history）与可查集合（published）来自同一次替换
+            self._published = new_published
+            self._history = new_history
+            self._retired.update(pruned)
+            return {
+                "keep_last": keep_last,
+                "pruned": sorted(pruned),
+                "kept_pinned": sorted(kept_pinned),
+                "remaining_history": list(self._history),
+                "current_version": self._history[-1] if self._history else None,
+            }
+
+    def rollback_to(self, version_id: str) -> DatasetVersion:
+        """回滚到指定的已发布版本；已清理的版本报 VersionRetiredError。"""
+        with self._lock:
+            if version_id in self._retired:
+                raise VersionRetiredError(
+                    f"版本 {version_id!r} 已被保留策略清理，无法回滚",
+                    detail={"version_id": version_id, "retired": True},
+                )
+            if version_id not in self._history:
+                reason = (
+                    "never_published"
+                    if version_id not in self._published
+                    else "not_in_rollback_range"
+                )
+                raise VersionNotFoundError(
+                    f"版本 {version_id!r} 不在当前可回滚范围内"
+                    f"（可回滚范围: {self._history}）",
+                    detail={
+                        "version_id": version_id,
+                        "reason": reason,
+                        "rollback_range": list(self._history),
+                    },
+                )
+            while self._history and self._history[-1] != version_id:
+                self._history.pop()
+            return self._published[version_id]

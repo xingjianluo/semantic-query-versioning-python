@@ -63,3 +63,15 @@ class NoActiveVersionError(SemanticQueryError):
     """尚无任何已发布版本，无法查询或回滚。"""
 
     code = "no_active_version"
+
+
+class VersionRetiredError(SemanticQueryError):
+    """指定的版本曾经发布过，但已被保留策略清理，不再可用。"""
+
+    code = "version_retired"
+
+
+class DiffIncompatibleError(SemanticQueryError):
+    """两个版本无法对比（例如表集合不一致），并说明原因。"""
+
+    code = "diff_incompatible"
